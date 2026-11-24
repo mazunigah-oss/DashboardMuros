@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8"><title>Avance muros de contención</title>
+<style>
+body{margin:0;font:14px system-ui,sans-serif;display:flex;height:100vh;color:#222}
+#plano{flex:1;background:#fff;cursor:grab}
+#panel{width:340px;padding:12px;overflow:auto;border-left:1px solid #ddd;background:#fafafa}
+h1{font-size:17px;margin:0 0 8px} h2{font-size:14px;margin:16px 0 6px}
+button{font:inherit;padding:5px 8px;margin:2px 0;border:1px solid #bbb;border-radius:4px;background:#fff;cursor:pointer}
+.est{display:flex;align-items:center;gap:8px;width:100%;text-align:left}
+.sw{width:26px;height:8px;border-radius:2px;display:inline-block}
+.kpi{font-size:28px;font-weight:700} small{color:#666}
+table{border-collapse:collapse;width:100%} td{padding:2px 4px;border-bottom:1px solid #eee}
+tr:hover{background:#eef} .chip{display:inline-block;width:14px;height:10px;margin-right:2px;border-radius:2px}
+</style></head><body>
+<svg id="plano"></svg>
+<div id="panel">
+  <h1 id="titulo"></h1>
+  <div><span class="kpi" id="kpi"></span> <small>avance ponderado de muros</small></div>
+  <div id="sel"><small>Haz clic en un tramo (Shift + clic para varios).</small></div>
+  <h2>Marcar estado</h2><div id="botones"></div>
+  <h2>Archivo</h2>
+  <button onclick="guardarHTML()">💾 Guardar en el HTML</button>
+  <button onclick="document.getElementById('fdxf').click()">📂 Cargar DXF</button>
+  <button onclick="exportCSV()">📄 Reporte CSV</button>
+  <button onclick="exportPNG()">🖼 Plano PNG</button>
+  <input type="file" id="fdxf" accept=".dxf" hidden onchange="cargarDXF(this.files[0])">
+  <div><small id="info"></small></div>
+  <h2>Resumen por estado</h2><div id="resumen"></div>
+  <h2>Por sitio <small>(casa | patio)</small></h2><table id="sitios"></table>
+</div>
+<script id="datos" type="application/json">__DATOS__</script>
+<script>
+// ===================== CONFIGURACIÓN (editar para otros proyectos) =====================
+const PROYECTO = 'Loma La Cruz Norte — avance muros';
+const ESTADOS = [ // [nombre, color, % avance ponderado]
+  ['Sin iniciar',           '#b0b0b0',   0],
+  ['Excavación',            '#f5c518',  40],
+  ['Emplantillado',         '#b6e03c',  42],
+  ['Zapata + enfierradura', '#3cba54',  57],
+  ['Hormigón MC + moldaje', '#3cc2a8',  77],
+  ['Impermeabilización',    '#3d9df2', 100],
+  ['Relleno',               '#2335f5', 100]];
+const CAPA_MURO = /^M_(.+)_(CASA|PATIO)$/i;   // capas de muros en el DXF: M_<muro>_CASA / M_<muro>_PATIO
+const BASE = {BASE_DESLINDES:'#999', BASE_LIMITE:'#e9a0e9', BASE_EDIFICIOS:'#9aa5ff'}; // otras capas = gris claro
+// =======================================================================================
+const FUENTE = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+const CLAVE = 'avance-muros:' + PROYECTO;
+let D = JSON.parse(document.getElementById('datos').textContent);
+const local = JSON.parse(localStorage.getItem(CLAVE) || 'null');
+if (local && local.guardado > (D.guardado || 0) && local.dxf === D.dxf) D.estado = local.estado, D.guardado = local.guardado;
+let G, sel = new Set(), svg = document.getElementById('plano'), vb;
+const hoy = () => new Date().toISOString().slice(0, 10);
+
+function parseDXF(txt) { // LWPOLYLINE, LINE, TEXT, MTEXT
+  const L = txt.split(/\r?\n/), ents = []; let e = null, enEnt = false;
+  for (let i = 0; i + 1 < L.length; i += 2) {
+    const c = +L[i], v = L[i + 1].trim();
+    if (c === 2 && L[i - 2] && L[i - 2].trim() === '0' && L[i - 1].trim() === 'SECTION') enEnt = v === 'ENTITIES';
+    if (!enEnt) continue;
+    if (c === 0) { e = {t: v, x: [], y: []}; ents.push(e); continue; }
+    if (!e) continue;
+    if (c === 8) e.capa = v; else if (c === 1) e.txt = v; else if (c === 40) e.h = +v;
+    else if (c === 10 || c === 11) e.x.push(+v); else if (c === 20 || c === 21) e.y.push(-v);
+  }
+  const lin = [], txts = [];
+  for (const e of ents) {
+    if (e.t === 'LWPOLYLINE' || e.t === 'LINE') lin.push({capa: e.capa, p: e.x.map((x, k) => [x, e.y[k]])});
+    if ((e.t === 'TEXT' || e.t === 'MTEXT') && e.txt) txts.push({capa: e.capa, x: e.x.at(-1), y: e.y.at(-1), h: e.h || 1, s: e.txt.replace(/\\P/g, ' ')});
+  }
+  return {lin, txts};
+}
+function construir() {
+  G = parseDXF(D.dxf); G.tramos = {};
+  for (const l of G.lin) { const m = (l.capa || '').match(CAPA_MURO); if (!m) continue;
+    const id = m[1] + '/' + m[2][0].toUpperCase(), t = G.tramos[id] ??= {id, muro: m[1], zona: m[2].toUpperCase() === 'CASA' ? 'Casa' : 'Patio', lin: [], largo: 0};
+    t.lin.push(l.p); t.largo += l.p.slice(1).reduce((a, q, k) => a + Math.hypot(q[0] - l.p[k][0], q[1] - l.p[k][1]), 0);
+    t.sitio = Math.min(...(m[1].match(/\d+/g) || [0]).map(Number)); }
+  const xs = G.lin.flatMap(l => l.p.map(q => q[0])), ys = G.lin.flatMap(l => l.p.map(q => q[1]));
+  const x0 = Math.min(...xs), y0 = Math.min(...ys), w = Math.max(...xs) - x0, h = Math.max(...ys) - y0, m = 0.03 * Math.max(w, h);
+  vb = [x0 - m, y0 - m, w + 2 * m, h + 2 * m]; dibujar();
+}
+const est = id => (D.estado[id] || {e: 0}).e;
+const pts = p => p.map(q => q.join(',')).join(' ');
+function dibujar() {
+  let s = '';
+  for (const l of G.lin) if (!CAPA_MURO.test(l.capa || ''))
+    s += `<polyline points="${pts(l.p)}" fill="none" stroke="${BASE[l.capa] || '#ccc'}" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
+  for (const t of G.txts) s += `<text x="${t.x}" y="${t.y}" font-size="${t.h}" text-anchor="middle" dominant-baseline="middle" fill="#666" font-family="sans-serif">${t.s}</text>`;
+  for (const t of Object.values(G.tramos)) {
+    const [n, col] = ESTADOS[est(t.id)], dash = t.zona === 'Patio' ? 'stroke-dasharray="7 5"' : '';
+    for (const p of t.lin) s += `<polyline points="${pts(p)}" fill="none" stroke="${col}" stroke-width="${sel.has(t.id) ? 9 : 5}" ${dash} stroke-linecap="butt" vector-effect="non-scaling-stroke"/>`;
+    for (const p of t.lin) s += `<polyline class="hit" data-id="${t.id}" points="${pts(p)}" fill="none" stroke="#000" stroke-opacity="${sel.has(t.id) ? .25 : 0}" stroke-width="16" vector-effect="non-scaling-stroke" style="cursor:pointer"><title>Muro ${t.muro} · ${t.zona} · Sitio ${t.sitio} · ${n}${D.estado[t.id] ? ' (' + D.estado[t.id].f + ')' : ''}</title></polyline>`;
+  }
+  svg.innerHTML = s; svg.setAttribute('viewBox', vb.join(' ')); panel();
+}
+function panel() {
+  document.getElementById('titulo').textContent = PROYECTO;
+  const T = Object.values(G.tramos), tot = T.reduce((a, t) => a + t.largo, 0) || 1;
+  document.getElementById('kpi').textContent = (T.reduce((a, t) => a + t.largo * ESTADOS[est(t.id)][2], 0) / tot).toFixed(1) + ' %';
+  document.getElementById('sel').innerHTML = sel.size ? `<b>${sel.size} tramo(s):</b> ${[...sel].join(', ')} <button onclick="sel.clear();dibujar()">✕</button>` : '<small>Haz clic en un tramo (Shift + clic para varios).</small>';
+  document.getElementById('botones').innerHTML = ESTADOS.map(([n, c], i) => `<button class="est" onclick="marcar(${i})" ${sel.size ? '' : 'disabled'}><span class="sw" style="background:${c}"></span>${n}</button>`).join('');
+  document.getElementById('resumen').innerHTML = ESTADOS.map(([n, c], i) => `<div><span class="chip" style="background:${c}"></span>${n}: <b>${T.filter(t => est(t.id) === i).length}</b> tramos</div>`).join('');
+  const S = {}; for (const t of T) (S[t.sitio] ??= []).push(t);
+  const chips = (L, z) => L.filter(t => t.zona === z).map(t => `<span class="chip" title="${t.id}: ${ESTADOS[est(t.id)][0]}" style="background:${ESTADOS[est(t.id)][1]}"></span>`).join('');
+  document.getElementById('sitios').innerHTML = Object.keys(S).sort((a, b) => a - b).map(k => `<tr onclick="selSitio(${k})" style="cursor:pointer"><td>Sitio ${k}</td><td>${chips(S[k], 'Casa')}</td><td>${chips(S[k], 'Patio')}</td></tr>`).join('');
+  document.getElementById('info').textContent = D.guardado ? 'Último cambio: ' + new Date(D.guardado).toLocaleString('es-CL') : '';
+}
+function selSitio(k) { sel = new Set(Object.values(G.tramos).filter(t => t.sitio === k).map(t => t.id)); dibujar(); }
+function marcar(i) {
+  for (const id of sel) i ? D.estado[id] = {e: i, f: hoy()} : delete D.estado[id];
+  sel.clear(); D.guardado = Date.now(); localStorage.setItem(CLAVE, JSON.stringify(D)); dibujar();
+}
+// ---- zoom (rueda) y desplazamiento (arrastrar) ----
+let arr = null, movido = false;
+svg.onwheel = ev => { ev.preventDefault(); const r = svg.getBoundingClientRect(), f = ev.deltaY > 0 ? 1.15 : 1 / 1.15, s = Math.max(vb[2] / r.width, vb[3] / r.height);
+  const cx = vb[0] + (ev.clientX - r.left - (r.width - vb[2] / s) / 2) * s, cy = vb[1] + (ev.clientY - r.top - (r.height - vb[3] / s) / 2) * s;
+  vb = [cx - (cx - vb[0]) * f, cy - (cy - vb[1]) * f, vb[2] * f, vb[3] * f]; svg.setAttribute('viewBox', vb.join(' ')); };
+svg.onmousedown = ev => { arr = [ev.clientX, ev.clientY, vb[0], vb[1]]; movido = false; };
+onmousemove = ev => { if (!arr) return; const r = svg.getBoundingClientRect(), s = Math.max(vb[2] / r.width, vb[3] / r.height), dx = ev.clientX - arr[0], dy = ev.clientY - arr[1];
+  if (Math.abs(dx) + Math.abs(dy) > 3) movido = true; vb[0] = arr[2] - dx * s; vb[1] = arr[3] - dy * s; svg.setAttribute('viewBox', vb.join(' ')); };
+onmouseup = ev => { const a = arr; arr = null; if (!a || movido) return; const id = ev.target.dataset && ev.target.dataset.id;
+  if (!id) return; if (!ev.shiftKey) { const ya = sel.has(id) && sel.size === 1; sel.clear(); if (ya) return dibujar(); }
+  sel.has(id) ? sel.delete(id) : sel.add(id); dibujar(); };
+// ---- archivos ----
+function bajar(blob, nombre) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = nombre; a.click(); }
+async function guardarHTML() {
+  const json = JSON.stringify(D).replace(/</g, '\\u003c');
+  const html = FUENTE.replace(/(<script id="datos" type="application\/json">)[\s\S]*?(<\/script>)/, (_, a, b) => a + json + b);
+  const blob = new Blob([html], {type: 'text/html'});
+  if (window.showSaveFilePicker) try { const h = await showSaveFilePicker({suggestedName: 'dashboard_muros.html', types: [{accept: {'text/html': ['.html']}}]});
+    const w = await h.createWritable(); await w.write(blob); return w.close(); } catch (e) { if (e.name === 'AbortError') return; }
+  bajar(blob, 'dashboard_muros_' + hoy() + '.html');
+}
+function cargarDXF(f) { if (!f) return; f.text().then(t => { D.dxf = t; sel.clear(); construir();
+  document.getElementById('info').textContent = `DXF cargado: ${Object.keys(G.tramos).length} tramos. Recuerda guardar el HTML.`; }); }
+function exportCSV() {
+  const filas = [['Tramo', 'Muro', 'Sitio asignado', 'Zona', 'Estado', 'Avance %', 'Fecha', 'Largo (unid. DXF)']];
+  for (const t of Object.values(G.tramos).sort((a, b) => a.sitio - b.sitio || a.id.localeCompare(b.id))) {
+    const [n, , p] = ESTADOS[est(t.id)]; filas.push([t.id, t.muro, t.sitio, t.zona, n, p, (D.estado[t.id] || {}).f || '', t.largo.toFixed(2).replace('.', ',')]); }
+  bajar(new Blob(['﻿' + filas.map(f => f.join(';')).join('\n')], {type: 'text/csv'}), 'avance_muros_' + hoy() + '.csv');
+}
+function exportPNG() {
+  const W = 2000, H = Math.round(W * vb[3] / vb[2]), n = ESTADOS.length, lh = 34;
+  const ley = ESTADOS.map(([t, c], i) => `<rect x="20" y="${70 + i * lh}" width="50" height="10" fill="${c}"/><text x="85" y="${80 + i * lh}" font-size="22">${t}</text>`).join('')
+    + `<line x1="20" y1="${75 + n * lh}" x2="70" y2="${75 + n * lh}" stroke="#555" stroke-width="5"/><text x="85" y="${80 + n * lh}" font-size="22">Zona casa</text>`
+    + `<line x1="20" y1="${75 + (n + 1) * lh}" x2="70" y2="${75 + (n + 1) * lh}" stroke="#555" stroke-width="5" stroke-dasharray="7 5"/><text x="85" y="${80 + (n + 1) * lh}" font-size="22">Fondo de patio</text>`;
+  const s = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}"><rect width="100%" height="100%" fill="#fff"/>`
+    + `<svg viewBox="${vb.join(' ')}" width="${W}" height="${H}">${svg.innerHTML}</svg>`
+    + `<g font-family="sans-serif"><rect x="8" y="8" width="330" height="${100 + (n + 2) * lh}" fill="#fff" stroke="#ccc"/><text x="20" y="45" font-size="24" font-weight="700">${PROYECTO}</text>${ley}<text x="20" y="${85 + (n + 2) * lh}" font-size="18" fill="#666">${hoy()} · avance ${document.getElementById('kpi').textContent}</text></g></svg>`;
+  const img = new Image(); img.onload = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; c.getContext('2d').drawImage(img, 0, 0); c.toBlob(b => bajar(b, 'plano_avance_' + hoy() + '.png')); };
+  img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(s.replace(/<title>.*?<\/title>/g, ''));
+}
+construir();
+</script></body></html>
